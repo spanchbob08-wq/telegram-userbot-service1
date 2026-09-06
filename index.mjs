@@ -1,53 +1,22 @@
 import 'dotenv/config';
+import express from 'express';
 
-import { TelegramClient } from 'telegram';
-import { StringSession } from 'telegram/sessions/index.js';
-import input from 'input';
+const app = express();
+app.use(express.json());
 
-const apiId = Number(process.env.TELEGRAM_API_ID);
-const apiHash = process.env.TELEGRAM_API_HASH;
+const PORT = Number(process.env.PORT || 10000);
 
-if (!apiId || !apiHash) {
-  console.log('❌ Проверь TELEGRAM_API_ID и TELEGRAM_API_HASH в .env');
-  process.exit(1);
-}
-
-const client = new TelegramClient(
-  new StringSession(''),
-  apiId,
-  apiHash,
-  {
-    connectionRetries: 5
-  }
-);
-
-console.log('🔐 Авторизация Telegram...');
-
-await client.start({
-  phoneNumber: async () =>
-    await input.text('Введите номер телефона: '),
-
-  password: async () =>
-    await input.text('Введите пароль 2FA, если есть: '),
-
-  phoneCode: async () =>
-    await input.text('Введите код из Telegram: '),
-
-  onError: (err) => {
-    console.log('❌ Ошибка:', err.message);
-  }
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'telegram-userbot-service'
+  });
 });
 
-const me = await client.getMe();
+app.get('/health', (req, res) => {
+  res.json({ ok: true });
+});
 
-console.log('');
-console.log('✅ АККАУНТ ПОДКЛЮЧЕН');
-console.log('ID:', String(me.id));
-console.log('Username:', me.username || 'нет');
-console.log('Имя:', me.firstName || '');
-
-console.log('');
-console.log('SESSION:');
-console.log(client.session.save());
-
-await client.disconnect();
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Userbot service started on port ${PORT}`);
+});
