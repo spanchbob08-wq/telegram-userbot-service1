@@ -2,619 +2,287 @@ import 'dotenv/config';
 import express from 'express';
 import crypto from 'crypto';
 import QRCode from 'qrcode';
-
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
+import { classifyTelegramError } from './errors.mjs';
+import { findDialogEntity } from './dialog-select.mjs';
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '64kb' }));
 
 const PORT = Number(process.env.PORT || 10000);
 const API_ID = Number(process.env.TELEGRAM_API_ID);
 const API_HASH = String(process.env.TELEGRAM_API_HASH || '');
 const SERVICE_KEY = String(process.env.SERVICE_KEY || '');
+const AUTH_TTL_MS = 10 * 60 * 1000;
 
-if (!API_ID || !API_HASH || !SERVICE_KEY) {
-  throw new Error('Проверь TELEGRAM_API_ID, TELEGRAM_API_HASH и SERVICE_KEY');
-}
+if (!API_ID || !API_HASH || !SERVICE_KEY) throw new Error('Required Telegram/Service environment variables are missing');
 
 const auths = new Map();
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function checkKey(req, res, next) {
-  if (req.headers['x-service-key'] !== SERVICE_KEY) {
-    return res.status(401).json({
-      ok: false,
-      error: 'UNAUTHORIZED'
-    });
+  if (String(req.headers['x-service-key'] || '') !== SERVICE_KEY) {
+    return res.status(401).json({ ok: false, code: 'UNAUTHORIZED', message: 'Unauthorized' });
   }
-
   next();
 }
 
 function makeClient(session = '') {
-  return new TelegramClient(
-    new StringSession(session),
-    API_ID,
-    API_HASH,
-    {
-      connectionRetries: 5,
-      useWSS: true
-    }
-  );
+  return new TelegramClient(new StringSession(String(session || '')), API_ID, API_HASH, {
+    connectionRetries: 5,
+    useWSS: true,
+  });
 }
 
-function getError(err) {
-  return err?.errorMessage || err?.message || String(err);
+function safeAccount(user) {
+  return {
+    id: String(user?.id || ''),
+    username: user?.username || null,
+    first_name: user?.firstName || '',
+    last_name: user?.lastName || '',
+    display_name: [user?.firstName, user?.lastName].filter(Boolean).join(' ').trim(),
+  };
+}
+
+function errorResponse(res, err, fallbackStatus = 500) {
+  const x = classifyTelegramError(err);
+  let status = fallbackStatus;
+  if (x.code === 'FLOOD_WAIT') status = 429;
+  if (x.code === 'DEFINITIVE_AUTH_FAILURE') status = 401;
+  console.error('Telegram error:', x.code);
+  return res.status(status).json({
+    ok: false,
+    code: x.code,
+    message: x.message,
+    ...(x.retry_after ? { retry_after: x.retry_after } : {}),
+    definitive: x.definitive,
+  });
 }
 
 async function cleanupAuth(authId) {
   const state = auths.get(authId);
-
   if (!state) return;
-
-  try {
-    await state.client?.disconnect();
-  } catch {}
-
+  try { await state.client?.disconnect(); } catch {}
   auths.delete(authId);
 }
 
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, state] of auths) {
+    if (now - state.createdAt > AUTH_TTL_MS) cleanupAuth(id).catch(() => {});
+  }
+}, 60_000).unref?.();
 
-/* =========================
-   HEALTH
-========================= */
+app.get('/', (_req, res) => res.json({ ok: true, service: 'telegram-userbot-service', version: 2 }));
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.get('/', (req, res) => {
-  res.json({
-    ok: true,
-    service: 'telegram-userbot-service'
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({ ok: true });
-});
-
-
-/* =========================
-   TELEGRAM CHECK
-========================= */
-
-app.get('/telegram-check', checkKey, async (req, res) => {
+app.get('/telegram-check', checkKey, async (_req, res) => {
   const client = makeClient();
-
   try {
     await client.connect();
-
-    res.json({
-      ok: true,
-      connected: true
-    });
+    return res.json({ ok: true, connected: true });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      connected: false,
-      error: getError(err)
-    });
+    return errorResponse(res, err);
   } finally {
-    try {
-      await client.disconnect();
-    } catch {}
+    try { await client.disconnect(); } catch {}
   }
 });
 
-
-/* =========================
-   НАЧАТЬ QR-АВТОРИЗАЦИЮ
-========================= */
-
 app.post('/auth/qr/start', checkKey, async (req, res) => {
-  const userId = String(req.body.userId || '');
-
-  if (!userId) {
-    return res.status(400).json({
-      ok: false,
-      error: 'USER_ID_REQUIRED'
-    });
-  }
+  const userId = String(req.body?.userId || '');
+  if (!userId) return res.status(400).json({ ok: false, code: 'USER_ID_REQUIRED' });
 
   const authId = crypto.randomUUID();
-
   const client = makeClient();
-
   const state = {
     authId,
     userId,
     client,
-
     status: 'starting',
-
     qrPng: null,
-    qrLink: null,
-
+    qrVersion: 0,
     session: null,
     account: null,
-
     passwordResolve: null,
-
+    passwordReject: null,
     createdAt: Date.now(),
-    error: null
+    error: null,
   };
-
   auths.set(authId, state);
 
-  try {
-    await client.connect();
-  } catch (err) {
-    await cleanupAuth(authId);
+  try { await client.connect(); }
+  catch (err) { await cleanupAuth(authId); return errorResponse(res, err); }
 
-    return res.status(500).json({
-      ok: false,
-      error: getError(err)
-    });
-  }
-
-
-  /*
-    Авторизация работает в фоне.
-  */
   client.signInUserWithQrCode(
+    { apiId: API_ID, apiHash: API_HASH },
     {
-      apiId: API_ID,
-      apiHash: API_HASH
-    },
-    {
-      qrCode: async (code) => {
-        const link =
-          `tg://login?token=${code.token.toString('base64url')}`;
-
-        state.qrLink = link;
-
-        state.qrPng = await QRCode.toBuffer(
-          link,
-          {
-            type: 'png',
-            width: 420,
-            margin: 2
-          }
-        );
-
+      qrCode: async ({ token }) => {
+        const link = `tg://login?token=${token.toString('base64url')}`;
+        state.qrPng = await QRCode.toBuffer(link, { type: 'png', width: 420, margin: 2 });
+        state.qrVersion += 1;
         state.status = 'waiting_scan';
       },
-
       password: async () => {
         state.status = 'password_required';
-
         return new Promise((resolve, reject) => {
           state.passwordResolve = resolve;
-
-          setTimeout(() => {
-            reject(new Error('2FA_TIMEOUT'));
-          }, 5 * 60 * 1000);
+          state.passwordReject = reject;
+          setTimeout(() => reject(new Error('2FA_TIMEOUT')), 5 * 60 * 1000);
         });
       },
-
-      onError: async (err) => {
-        state.error = getError(err);
-
-        console.error(
-          'QR auth:',
-          state.error
-        );
-
+      onError: async err => {
+        const x = classifyTelegramError(err);
+        state.error = { code: x.code, message: x.message };
         return true;
-      }
-    }
-  )
-  .then(async (user) => {
-    state.session =
-      client.session.save();
-
-    state.account = {
-      id: String(user.id),
-      username: user.username || null,
-      first_name: user.firstName || ''
-    };
-
+      },
+    },
+  ).then(user => {
+    state.session = client.session.save();
+    state.account = safeAccount(user);
     state.status = 'authorized';
-
     state.passwordResolve = null;
-  })
-  .catch((err) => {
-    state.error = getError(err);
+    state.passwordReject = null;
+  }).catch(err => {
+    const x = classifyTelegramError(err);
+    state.error = { code: x.code, message: x.message };
     state.status = 'error';
   });
 
-
-  /*
-    Даём GramJS немного времени
-    создать первый QR.
-  */
-  for (let i = 0; i < 50; i++) {
-    if (
-      state.qrPng ||
-      state.status === 'error'
-    ) break;
-
-    await new Promise(
-      resolve => setTimeout(resolve, 100)
-    );
+  for (let i = 0; i < 60; i++) {
+    if (state.qrPng || state.status === 'error' || state.status === 'authorized') break;
+    await sleep(100);
   }
+  if (state.status === 'error') return res.status(500).json({ ok: false, ...state.error });
 
-
-  if (state.status === 'error') {
-    return res.status(500).json({
-      ok: false,
-      error: state.error
-    });
-  }
-
-
-  res.json({
+  return res.json({
     ok: true,
-
     auth_id: authId,
-
     status: state.status,
-
-    qr_url:
-      `${req.protocol}://${req.get('host')}/auth/qr/image/${authId}`
+    qr_version: state.qrVersion,
+    qr_url: `${req.protocol}://${req.get('host')}/auth/qr/image/${authId}`,
+    expires_in: Math.floor(AUTH_TTL_MS / 1000),
   });
-
-
-  /*
-    Через 10 минут незавершённую
-    авторизацию удаляем.
-  */
-  setTimeout(async () => {
-    const current = auths.get(authId);
-
-    if (
-      current &&
-      current.status !== 'authorized'
-    ) {
-      await cleanupAuth(authId);
-    }
-  }, 10 * 60 * 1000);
 });
-
-
-/* =========================
-   QR-КАРТИНКА
-========================= */
 
 app.get('/auth/qr/image/:authId', async (req, res) => {
-  const state =
-    auths.get(req.params.authId);
-
-  if (!state?.qrPng) {
-    return res.status(404).send(
-      'QR not found or expired'
-    );
-  }
-
-  res.setHeader(
-    'Content-Type',
-    'image/png'
-  );
-
-  res.setHeader(
-    'Cache-Control',
-    'no-store'
-  );
-
-  res.send(state.qrPng);
+  const state = auths.get(req.params.authId);
+  if (!state?.qrPng) return res.status(404).send('QR not found or expired');
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  return res.send(state.qrPng);
 });
 
+app.get('/auth/qr/status/:authId', checkKey, async (req, res) => {
+  const state = auths.get(req.params.authId);
+  if (!state) return res.status(404).json({ ok: false, code: 'AUTH_NOT_FOUND' });
+  return res.json({
+    ok: true,
+    status: state.status,
+    qr_version: state.qrVersion,
+    account: state.account,
+    error: state.error,
+  });
+});
 
-/* =========================
-   СТАТУС QR
-========================= */
+app.post('/auth/qr/password', checkKey, async (req, res) => {
+  const authId = String(req.body?.authId || '');
+  let password = String(req.body?.password || '');
+  const state = auths.get(authId);
+  if (!state) return res.status(404).json({ ok: false, code: 'AUTH_NOT_FOUND' });
+  if (state.status !== 'password_required' || !state.passwordResolve) {
+    password = '';
+    return res.status(400).json({ ok: false, code: 'PASSWORD_NOT_REQUIRED' });
+  }
+  const resolve = state.passwordResolve;
+  state.passwordResolve = null;
+  state.passwordReject = null;
+  state.status = 'authorizing';
+  resolve(password);
+  password = '';
+  return res.json({ ok: true });
+});
 
-app.get(
-  '/auth/qr/status/:authId',
-  checkKey,
-  async (req, res) => {
-    const state =
-      auths.get(req.params.authId);
+app.post('/auth/qr/consume', checkKey, async (req, res) => {
+  const authId = String(req.body?.authId || '');
+  const state = auths.get(authId);
+  if (!state) return res.status(404).json({ ok: false, code: 'AUTH_NOT_FOUND' });
+  if (state.status !== 'authorized' || !state.session) {
+    return res.status(400).json({ ok: false, code: 'NOT_AUTHORIZED_YET', status: state.status });
+  }
+  const result = { ok: true, session: state.session, account: state.account };
+  await cleanupAuth(authId);
+  return res.json(result);
+});
 
-    if (!state) {
-      return res.status(404).json({
-        ok: false,
-        error: 'AUTH_NOT_FOUND'
-      });
+app.post('/dialogs', checkKey, async (req, res) => {
+  const session = String(req.body?.session || '');
+  const limit = Math.min(200, Math.max(1, Number(req.body?.limit || 100)));
+  if (!session) return res.status(400).json({ ok: false, code: 'SESSION_REQUIRED' });
+  const client = makeClient(session);
+  try {
+    await client.connect();
+    if (!(await client.checkAuthorization())) {
+      return res.status(401).json({ ok: false, code: 'DEFINITIVE_AUTH_FAILURE', message: 'SESSION_EXPIRED', definitive: true });
     }
-
-    res.json({
+    const dialogs = await client.getDialogs({ limit });
+    return res.json({
       ok: true,
-
-      status: state.status,
-
-      account: state.account,
-
-      error: state.error
+      dialogs: dialogs.map(d => ({
+        id: String(d.id),
+        title: d.title || d.name || 'Без названия',
+        is_group: Boolean(d.isGroup),
+        is_channel: Boolean(d.isChannel),
+        is_user: Boolean(d.isUser),
+      })),
     });
+  } catch (err) {
+    return errorResponse(res, err);
+  } finally {
+    try { await client.disconnect(); } catch {}
   }
-);
+});
 
-
-/* =========================
-   2FA
-
-   Пароль нигде не сохраняется.
-   Он только передаётся ожидающему
-   GramJS promise.
-========================= */
-
-app.post(
-  '/auth/qr/password',
-  checkKey,
-  async (req, res) => {
-    const authId =
-      String(req.body.authId || '');
-
-    const password =
-      String(req.body.password || '');
-
-    const state =
-      auths.get(authId);
-
-    if (!state) {
-      return res.status(404).json({
-        ok: false,
-        error: 'AUTH_NOT_FOUND'
-      });
+app.post('/account/check', checkKey, async (req, res) => {
+  const session = String(req.body?.session || '');
+  if (!session) return res.status(400).json({ ok: false, code: 'SESSION_REQUIRED' });
+  const client = makeClient(session);
+  try {
+    await client.connect();
+    if (!(await client.checkAuthorization())) {
+      return res.status(401).json({ ok: false, code: 'DEFINITIVE_AUTH_FAILURE', message: 'SESSION_EXPIRED', definitive: true });
     }
-
-    if (
-      state.status !== 'password_required' ||
-      !state.passwordResolve
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'PASSWORD_NOT_REQUIRED'
-      });
-    }
-
-    const resolve =
-      state.passwordResolve;
-
-    state.passwordResolve = null;
-    state.status = 'authorizing';
-
-    resolve(password);
-
-    res.json({
-      ok: true
-    });
+    const me = await client.getMe();
+    return res.json({ ok: true, account: safeAccount(me) });
+  } catch (err) {
+    return errorResponse(res, err);
+  } finally {
+    try { await client.disconnect(); } catch {}
   }
-);
+});
 
+app.post('/send', checkKey, async (req, res) => {
+  const session = String(req.body?.session || '');
+  const chatId = String(req.body?.chatId || '');
+  const text = String(req.body?.text || '');
+  if (!session || !chatId || !text) return res.status(400).json({ ok: false, code: 'SESSION_CHAT_TEXT_REQUIRED' });
 
-/* =========================
-   ЗАБРАТЬ ГОТОВУЮ SESSION
-
-   Позже её будет забирать
-   Cloudflare и хранить
-   зашифрованно в D1.
-========================= */
-
-app.post(
-  '/auth/qr/consume',
-  checkKey,
-  async (req, res) => {
-    const authId =
-      String(req.body.authId || '');
-
-    const state =
-      auths.get(authId);
-
-    if (!state) {
-      return res.status(404).json({
-        ok: false,
-        error: 'AUTH_NOT_FOUND'
-      });
+  const client = makeClient(session);
+  try {
+    await client.connect();
+    if (!(await client.checkAuthorization())) {
+      return res.status(401).json({ ok: false, code: 'DEFINITIVE_AUTH_FAILURE', message: 'SESSION_EXPIRED', definitive: true });
     }
-
-    if (
-      state.status !== 'authorized' ||
-      !state.session
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'NOT_AUTHORIZED_YET'
-      });
-    }
-
-    const result = {
-      ok: true,
-
-      session: state.session,
-
-      account: state.account
-    };
-
-    await cleanupAuth(authId);
-
-    res.json(result);
+    const dialogs = await client.getDialogs({ limit: 200 });
+    const entity = findDialogEntity(dialogs, chatId) || await client.getEntity(BigInt(chatId));
+    const message = await client.sendMessage(entity, { message: text });
+    return res.json({ ok: true, message_id: message.id });
+  } catch (err) {
+    return errorResponse(res, err);
+  } finally {
+    try { await client.disconnect(); } catch {}
   }
-);
+});
 
-
-/* =========================
-   ПОЛУЧИТЬ ЧАТЫ
-========================= */
-
-app.post(
-  '/dialogs',
-  checkKey,
-  async (req, res) => {
-    const session =
-      String(req.body.session || '');
-
-    if (!session) {
-      return res.status(400).json({
-        ok: false,
-        error: 'SESSION_REQUIRED'
-      });
-    }
-
-    const client =
-      makeClient(session);
-
-    try {
-      await client.connect();
-
-      if (
-        !(await client.checkAuthorization())
-      ) {
-        return res.status(401).json({
-          ok: false,
-          error: 'SESSION_EXPIRED'
-        });
-      }
-
-      const dialogs =
-        await client.getDialogs({
-          limit: 100
-        });
-
-      res.json({
-        ok: true,
-
-        dialogs:
-          dialogs.map(d => ({
-            id: String(d.id),
-
-            title:
-              d.title ||
-              d.name ||
-              'Без названия',
-
-            is_group:
-              Boolean(d.isGroup),
-
-            is_channel:
-              Boolean(d.isChannel),
-
-            is_user:
-              Boolean(d.isUser)
-          }))
-      });
-
-    } catch (err) {
-      res.status(500).json({
-        ok: false,
-        error: getError(err)
-      });
-
-    } finally {
-      try {
-        await client.disconnect();
-      } catch {}
-    }
-  }
-);
-
-
-/* =========================
-   ОТПРАВКА ОТ ЛИЦА
-========================= */
-
-app.post(
-  '/send',
-  checkKey,
-  async (req, res) => {
-    const session =
-      String(req.body.session || '');
-
-    const chatId =
-      String(req.body.chatId || '');
-
-    const text =
-      String(req.body.text || '');
-
-    if (
-      !session ||
-      !chatId ||
-      !text
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          'SESSION_CHAT_TEXT_REQUIRED'
-      });
-    }
-
-    const client =
-      makeClient(session);
-
-    try {
-      await client.connect();
-
-      if (
-        !(await client.checkAuthorization())
-      ) {
-        return res.status(401).json({
-          ok: false,
-          error: 'SESSION_EXPIRED'
-        });
-      }
-
-      const entity =
-        await client.getEntity(
-          BigInt(chatId)
-        );
-
-      const message =
-        await client.sendMessage(
-          entity,
-          {
-            message: text
-          }
-        );
-
-      res.json({
-        ok: true,
-        message_id: message.id
-      });
-
-    } catch (err) {
-      const message =
-        getError(err);
-
-      /*
-        FLOOD_WAIT не обходим.
-      */
-      if (
-        message.includes('FLOOD_WAIT')
-      ) {
-        return res.status(429).json({
-          ok: false,
-          error: message
-        });
-      }
-
-      res.status(500).json({
-        ok: false,
-        error: message
-      });
-
-    } finally {
-      try {
-        await client.disconnect();
-      } catch {}
-    }
-  }
-);
-
-
-app.listen(
-  PORT,
-  '0.0.0.0',
-  () => {
-    console.log(
-      `Userbot service started on port ${PORT}`
-    );
-  }
-);
+app.listen(PORT, '0.0.0.0', () => console.log(`Userbot service started on port ${PORT}`));
