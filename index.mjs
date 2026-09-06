@@ -74,6 +74,27 @@ setInterval(() => {
   }
 }, 60_000).unref?.();
 
+
+
+async function waitForAuthState(state, blockedStatuses, timeoutMs = 12000) {
+  const blocked = new Set(blockedStatuses);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!blocked.has(state.status)) return;
+    await sleep(150);
+  }
+}
+
+function phoneAuthPayload(state) {
+  return {
+    ok: true,
+    status: state.status,
+    account: state.account,
+    error: state.error,
+    expires_in: Math.max(0, Math.floor((state.createdAt + AUTH_TTL_MS - Date.now()) / 1000)),
+  };
+}
+
 app.get('/', (_req, res) => res.json({ ok: true, service: 'telegram-userbot-service', version: 2 }));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -88,6 +109,153 @@ app.get('/telegram-check', checkKey, async (_req, res) => {
     try { await client.disconnect(); } catch {}
   }
 });
+
+
+
+app.post('/auth/phone/start', checkKey, async (req, res) => {
+  const userId = String(req.body?.userId || '');
+  let phoneNumber = String(req.body?.phoneNumber || '').replace(/[\s()\-]/g, '');
+  if (!userId) return res.status(400).json({ ok: false, code: 'USER_ID_REQUIRED' });
+  if (!/^\+\d{7,15}$/.test(phoneNumber)) {
+    phoneNumber = '';
+    return res.status(400).json({ ok: false, code: 'PHONE_INVALID', message: 'Use international format, for example +79991234567' });
+  }
+
+  const authId = crypto.randomUUID();
+  const client = makeClient();
+  const state = {
+    authId,
+    userId,
+    client,
+    status: 'starting_phone',
+    session: null,
+    account: null,
+    codeResolve: null,
+    codeReject: null,
+    passwordResolve: null,
+    passwordReject: null,
+    createdAt: Date.now(),
+    error: null,
+  };
+  auths.set(authId, state);
+
+  try { await client.connect(); }
+  catch (err) { phoneNumber = ''; await cleanupAuth(authId); return errorResponse(res, err); }
+
+  client.start({
+    phoneNumber,
+    phoneCode: async () => {
+      state.status = 'waiting_code';
+      return new Promise((resolve, reject) => {
+        state.codeResolve = resolve;
+        state.codeReject = reject;
+        setTimeout(() => reject(new Error('PHONE_CODE_TIMEOUT')), 5 * 60 * 1000);
+      });
+    },
+    password: async () => {
+      state.status = 'password_required';
+      return new Promise((resolve, reject) => {
+        state.passwordResolve = resolve;
+        state.passwordReject = reject;
+        setTimeout(() => reject(new Error('2FA_TIMEOUT')), 5 * 60 * 1000);
+      });
+    },
+    // This flow is login-only. Never create a new Telegram account from the mailer.
+    firstAndLastNames: async () => {
+      throw new Error('PHONE_NOT_REGISTERED');
+    },
+    onError: async err => {
+      const x = classifyTelegramError(err);
+      state.error = { code: x.code, message: x.message };
+      // Invalid code/password should allow another attempt. Fatal transport/auth errors stop the flow.
+      if (/PHONE_CODE_INVALID|PASSWORD_HASH_INVALID|PHONE_CODE_EMPTY|PHONE_CODE_EXPIRED/i.test(String(x.message || ''))) return false;
+      return x.definitive || /AUTH_USER_CANCEL|PHONE_NUMBER_INVALID|PHONE_NUMBER_BANNED|PHONE_NUMBER_FLOOD/i.test(String(x.message || ''));
+    },
+  }).then(async () => {
+    const user = await client.getMe();
+    state.session = client.session.save();
+    state.account = safeAccount(user);
+    state.status = 'authorized';
+    state.codeResolve = null;
+    state.codeReject = null;
+    state.passwordResolve = null;
+    state.passwordReject = null;
+    state.error = null;
+  }).catch(err => {
+    const x = classifyTelegramError(err);
+    state.error = { code: x.code, message: x.message };
+    state.status = 'error';
+  }).finally(() => {
+    phoneNumber = '';
+  });
+
+  await waitForAuthState(state, ['starting_phone'], 15000);
+  if (state.status === 'error') return res.status(400).json({ ok: false, ...state.error });
+  return res.json({ auth_id: authId, ...phoneAuthPayload(state) });
+});
+
+app.get('/auth/phone/status/:authId', checkKey, async (req, res) => {
+  const state = auths.get(req.params.authId);
+  if (!state) return res.status(404).json({ ok: false, code: 'AUTH_NOT_FOUND' });
+  return res.json(phoneAuthPayload(state));
+});
+
+app.post('/auth/phone/code', checkKey, async (req, res) => {
+  const authId = String(req.body?.authId || '');
+  let code = String(req.body?.code || '').replace(/\s/g, '');
+  const state = auths.get(authId);
+  if (!state) { code = ''; return res.status(404).json({ ok: false, code: 'AUTH_NOT_FOUND' }); }
+  if (state.status !== 'waiting_code' || !state.codeResolve) {
+    code = '';
+    return res.status(400).json({ ok: false, code: 'CODE_NOT_REQUIRED', status: state.status });
+  }
+  if (!/^\d{3,10}$/.test(code)) {
+    code = '';
+    return res.status(400).json({ ok: false, code: 'CODE_INVALID_FORMAT' });
+  }
+  const resolve = state.codeResolve;
+  state.codeResolve = null;
+  state.codeReject = null;
+  state.error = null;
+  state.status = 'authorizing_code';
+  resolve(code);
+  code = '';
+  await waitForAuthState(state, ['authorizing_code'], 15000);
+  return res.json(phoneAuthPayload(state));
+});
+
+app.post('/auth/phone/password', checkKey, async (req, res) => {
+  const authId = String(req.body?.authId || '');
+  let password = String(req.body?.password || '');
+  const state = auths.get(authId);
+  if (!state) { password = ''; return res.status(404).json({ ok: false, code: 'AUTH_NOT_FOUND' }); }
+  if (state.status !== 'password_required' || !state.passwordResolve) {
+    password = '';
+    return res.status(400).json({ ok: false, code: 'PASSWORD_NOT_REQUIRED', status: state.status });
+  }
+  const resolve = state.passwordResolve;
+  state.passwordResolve = null;
+  state.passwordReject = null;
+  state.error = null;
+  state.status = 'authorizing_password';
+  resolve(password);
+  password = '';
+  await waitForAuthState(state, ['authorizing_password'], 15000);
+  return res.json(phoneAuthPayload(state));
+});
+
+app.post('/auth/phone/consume', checkKey, async (req, res) => {
+  const authId = String(req.body?.authId || '');
+  const state = auths.get(authId);
+  if (!state) return res.status(404).json({ ok: false, code: 'AUTH_NOT_FOUND' });
+  if (state.status !== 'authorized' || !state.session) {
+    return res.status(400).json({ ok: false, code: 'NOT_AUTHORIZED_YET', status: state.status });
+  }
+  const result = { ok: true, session: state.session, account: state.account };
+  await cleanupAuth(authId);
+  return res.json(result);
+});
+
 
 app.post('/auth/qr/start', checkKey, async (req, res) => {
   const userId = String(req.body?.userId || '');
