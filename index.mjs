@@ -6,6 +6,7 @@ import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { classifyTelegramError } from './errors.mjs';
 import { findDialogEntity } from './dialog-select.mjs';
+import { sendBatchWithClient } from './send-batch.mjs';
 
 const app = express();
 app.use(express.json({ limit: '64kb' }));
@@ -430,11 +431,11 @@ app.post('/account/check', checkKey, async (req, res) => {
   }
 });
 
-app.post('/send', checkKey, async (req, res) => {
+app.post('/send-batch', checkKey, async (req, res) => {
   const session = String(req.body?.session || '');
-  const chatId = String(req.body?.chatId || '');
   const text = String(req.body?.text || '');
-  if (!session || !chatId || !text) return res.status(400).json({ ok: false, code: 'SESSION_CHAT_TEXT_REQUIRED' });
+  const chatIds = Array.isArray(req.body?.chatIds) ? req.body.chatIds.map(x => String(x || '')).filter(Boolean).slice(0, 50) : [];
+  if (!session || !text || !chatIds.length) return res.status(400).json({ ok: false, code: 'SESSION_CHATS_TEXT_REQUIRED' });
 
   const client = makeClient(session);
   try {
@@ -442,10 +443,41 @@ app.post('/send', checkKey, async (req, res) => {
     if (!(await client.checkAuthorization())) {
       return res.status(401).json({ ok: false, code: 'DEFINITIVE_AUTH_FAILURE', message: 'SESSION_EXPIRED', definitive: true });
     }
-    const dialogs = await client.getDialogs({ limit: 200 });
-    const entity = findDialogEntity(dialogs, chatId) || await client.getEntity(BigInt(chatId));
-    const message = await client.sendMessage(entity, { message: text });
-    return res.json({ ok: true, message_id: message.id });
+
+    const batch = await sendBatchWithClient(client, chatIds, text);
+    let flood = null;
+    let definitive = null;
+    let temporaryErrors = 0;
+    for (const item of batch.results) {
+      if (item.ok) continue;
+      const x = classifyTelegramError(item.error);
+      if (x.code === 'FLOOD_WAIT' && !flood) flood = x;
+      else if (x.definitive && !definitive) definitive = x;
+      else temporaryErrors += 1;
+    }
+
+    if (definitive) {
+      return res.status(401).json({
+        ok: false,
+        code: definitive.code,
+        message: definitive.message,
+        definitive: true,
+        sent: batch.sent,
+        temporary_errors: temporaryErrors,
+      });
+    }
+    if (flood) {
+      return res.status(429).json({
+        ok: false,
+        code: flood.code,
+        message: flood.message,
+        retry_after: flood.retry_after,
+        sent: batch.sent,
+        temporary_errors: temporaryErrors,
+      });
+    }
+
+    return res.json({ ok: true, sent: batch.sent, temporary_errors: temporaryErrors });
   } catch (err) {
     return errorResponse(res, err);
   } finally {
